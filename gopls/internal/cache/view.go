@@ -691,7 +691,7 @@ func (s *Snapshot) initialize(ctx context.Context, firstAttempt bool) {
 			// Previously, we loaded <modulepath>/... for each module path, but that
 			// is actually incorrect when the pattern may match packages in more than
 			// one module. See golang/go#59458 for more details.
-			scopes = append(scopes, moduleLoadScope{dir: modURI.DirPath(), modulePath: parsed.File.Module.Mod.Path})
+			// scopes = append(scopes, moduleLoadScope{dir: modURI.DirPath(), modulePath: parsed.File.Module.Mod.Path})
 		}
 	} else {
 		scopes = append(scopes, viewLoadScope{})

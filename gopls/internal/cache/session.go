@@ -341,6 +341,8 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 			}
 
 			v.snapshotMu.Lock()
+			// TODO: This can be optimized, we just need to take the
+			// packages.Load call out of the snapshotMu.
 			if err := v.snapshot.load(initCtx, NoNetwork, pkg); err != nil {
 				// TODO: Log here instead of panicking.
 				panic(err)

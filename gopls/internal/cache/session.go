@@ -307,7 +307,9 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		defer bgRelease()
 		snapshot.initialize(initCtx, true)
 
-		// To create go_list_export magic file, run:
+		// TODO: This should call `go list` rather than reading from a magic file.
+		//
+		// For PoC purposes, to create go_list_export magic file, run:
 		// go list -e -deps=true -find=false -pgo=off -- git.corp.stripe.com/stripe-internal/gocode/... > go_list_export
 		//
 		// Read from the file.
@@ -332,6 +334,12 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		// Load one package at a time in the goroutine. This way, regular usage
 		// of the IDE will still function while we lazy load all packages.
 		for _, pkg := range pkgs {
+			select {
+			case <-initCtx.Done():
+				return
+			default:
+			}
+
 			v.snapshotMu.Lock()
 			if err := v.snapshot.load(initCtx, NoNetwork, pkg); err != nil {
 				// TODO: Log here instead of panicking.
@@ -343,7 +351,11 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 			// letting goroutines fight over snapshotMu. That being said,
 			// there's some sweet spot between [0, 50ms] here, where sleeping
 			// may make the IDE feel less slow while it lazy loads.
-			time.Sleep(50 * time.Millisecond)
+			select {
+			case <-initCtx.Done():
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
 		}
 	}()
 

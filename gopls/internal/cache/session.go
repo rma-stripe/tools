@@ -5,6 +5,7 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -318,26 +319,22 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		if err != nil {
 			panic(err)
 		}
-		pkgs := strings.Split(string(exportContents), "\n")
-		// Sort packages with custom SortFunc which prioritizes gocode packages.
-		slices.SortFunc(pkgs, func(a, b string) int {
-			aIsGocodePkg := strings.HasPrefix(a, "git.corp.stripe.com/stripe-internal/gocode")
-			bIsGocodePkg := strings.HasPrefix(b, "git.corp.stripe.com/stripe-internal/gocode")
-			switch {
-			case aIsGocodePkg && bIsGocodePkg:
-				return strings.Compare(a, b)
-			case aIsGocodePkg:
-				return -1
-			case bIsGocodePkg:
-				return -1
-			default:
-				return strings.Compare(a, b)
+		// Filter out non-gocode packages. Loading packages works recursively,
+		// so vendored packages will still be loaded this way.
+		var pkgs []packageLoadScope
+		pkgDelimiter := []byte{'\n'}
+		pkgGocodePrefix := []byte("git.corp.stripe.com/stripe-internal/gocode")
+		for pkg := range bytes.SplitSeq(exportContents, pkgDelimiter) {
+			if bytes.HasPrefix(pkg, pkgGocodePrefix) {
+				pkgs = append(pkgs, packageLoadScope(pkg))
 			}
-		})
-		// Load one package at a time in the goroutine.
+		}
+		// Load one package at a time in the goroutine. This way, regular usage
+		// of the IDE will still function while we lazy load all packages.
 		for _, pkg := range pkgs {
 			v.snapshotMu.Lock()
-			if err := v.snapshot.load(initCtx, NoNetwork, packageLoadScope(pkg)); err != nil {
+			if err := v.snapshot.load(initCtx, NoNetwork, pkg); err != nil {
+				// TODO: Log here instead of panicking.
 				panic(err)
 			}
 			v.snapshotMu.Unlock()

@@ -306,11 +306,48 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		defer bgRelease()
 		snapshot.initialize(initCtx, true)
 
-		v.snapshotMu.Lock()
-		if err := v.snapshot.load(initCtx, NoNetwork, packageLoadScope("git.corp.stripe.com/stripe-internal/gocode/hello")); err != nil {
+		// To create go_list_export magic file, run:
+		// go list -e -deps=true -find=false -pgo=off -- git.corp.stripe.com/stripe-internal/gocode/... > go_list_export
+		//
+		// Read from the file.
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
 			panic(err)
 		}
-		v.snapshotMu.Unlock()
+		exportContents, err := os.ReadFile(filepath.Join(homeDir, "stripe", "gocode", "go_list_export"))
+		if err != nil {
+			panic(err)
+		}
+		pkgs := strings.Split(string(exportContents), "\n")
+		// Sort packages with custom SortFunc which prioritizes gocode packages.
+		slices.SortFunc(pkgs, func(a, b string) int {
+			aIsGocodePkg := strings.HasPrefix(a, "git.corp.stripe.com/stripe-internal/gocode")
+			bIsGocodePkg := strings.HasPrefix(b, "git.corp.stripe.com/stripe-internal/gocode")
+			switch {
+			case aIsGocodePkg && bIsGocodePkg:
+				return strings.Compare(a, b)
+			case aIsGocodePkg:
+				return -1
+			case bIsGocodePkg:
+				return -1
+			default:
+				return strings.Compare(a, b)
+			}
+		})
+		// Load one package at a time in the goroutine.
+		for _, pkg := range pkgs {
+			v.snapshotMu.Lock()
+			if err := v.snapshot.load(initCtx, NoNetwork, packageLoadScope(pkg)); err != nil {
+				panic(err)
+			}
+			v.snapshotMu.Unlock()
+
+			// Loads will be naturally interleaved somewhat, as a result of
+			// letting goroutines fight over snapshotMu. That being said,
+			// there's some sweet spot between [0, 50ms] here, where sleeping
+			// may make the IDE feel less slow while it lazy loads.
+			time.Sleep(50 * time.Millisecond)
+		}
 	}()
 
 	// Return a third reference to the caller.

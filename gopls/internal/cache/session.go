@@ -307,7 +307,9 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		defer bgRelease()
 		snapshot.initialize(initCtx, true)
 
-		// TODO: This should call `go list` rather than reading from a magic file.
+		// TODO: This should call `go list` rather than reading from a magic
+		// file... or maybe, if we plan not to upstream this, we can just find
+		// probable packages heuristically with a glob?
 		//
 		// For PoC purposes, to create go_list_export magic file, run:
 		// go list -e -deps=true -find=false -pgo=off -- git.corp.stripe.com/stripe-internal/gocode/... > go_list_export

@@ -306,16 +306,8 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		defer bgRelease()
 		snapshot.initialize(initCtx, true)
 
-		// We don't need this sleep, but it proves that all we need to do to get
-		// the latest snapshot is to take the snapshotMu.
-		time.Sleep(5 * time.Second)
-
-		uri := protocol.URIFromPath("/Users/rma/stripe/gocode/hello/hello.go")
 		v.snapshotMu.Lock()
-		if _, err := v.snapshot.ReadFile(initCtx, uri); err != nil {
-			panic(err)
-		}
-		if _, err := v.snapshot.MetadataForFile(initCtx, uri); err != nil {
+		if err := v.snapshot.load(initCtx, NoNetwork, packageLoadScope("git.corp.stripe.com/stripe-internal/gocode/hello")); err != nil {
 			panic(err)
 		}
 		v.snapshotMu.Unlock()

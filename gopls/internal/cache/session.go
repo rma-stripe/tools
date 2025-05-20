@@ -18,7 +18,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/gopls/internal/cache/metadata"
 	"golang.org/x/tools/gopls/internal/cache/typerefs"
 	"golang.org/x/tools/gopls/internal/file"
@@ -307,16 +306,48 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		defer bgRelease()
 		snapshot.initialize(initCtx, true)
 
-		ctx, cancel := context.WithTimeout(initCtx, 10*time.Minute)
-		defer cancel()
-
-		cfg := snapshot.config(ctx, NoNetwork)
-		pkgs, err := packages.Load(cfg, "git.corp.stripe.com/stripe-internal/gocode/...", "builtin")
-		if err != nil {
-			panic(err)
-		}
-		if err := v.snapshot.loadPackages(ctx, NoNetwork, pkgs); err != nil {
-			panic(err)
+		if len(v.workspaceModFiles) > 0 {
+			var scopes []loadScope
+			for modURI := range v.workspaceModFiles {
+				// Verify that the modfile is valid before trying to load it.
+				//
+				// TODO(rfindley): now that we no longer need to parse the modfile in
+				// order to load scope, we could move these diagnostics to a more general
+				// location where we diagnose problems with modfiles or the workspace.
+				//
+				// Be careful not to add context cancellation errors as critical module
+				// errors.
+				fh, err := s.ReadFile(ctx, modURI)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					// addError(modURI, err)
+					continue
+				}
+				parsed, err := v.snapshot.ParseMod(ctx, fh)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					// addError(modURI, err)
+					continue
+				}
+				if parsed.File == nil || parsed.File.Module == nil {
+					// addError(modURI, fmt.Errorf("no module path for %s", modURI))
+					continue
+				}
+				// Previously, we loaded <modulepath>/... for each module path, but that
+				// is actually incorrect when the pattern may match packages in more than
+				// one module. See golang/go#59458 for more details.
+				scopes = append(scopes, moduleLoadScope{dir: modURI.DirPath(), modulePath: parsed.File.Module.Mod.Path})
+			}
+			if len(scopes) > 0 {
+				scopes = append(scopes, packageLoadScope("builtin"))
+			}
+			if err := v.snapshot.load(initCtx, NoNetwork, scopes...); err != nil {
+				panic(err)
+			}
 		}
 	}()
 

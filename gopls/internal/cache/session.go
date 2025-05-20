@@ -326,23 +326,27 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		}
 		// Filter out non-gocode packages. Loading packages works recursively,
 		// so vendored packages will still be loaded this way.
-		var pkgs []loadScope
+		var pkgs []string
 		pkgDelimiter := []byte{'\n'}
 		pkgGocodePrefix := []byte("git.corp.stripe.com/stripe-internal/gocode")
 		for pkg := range bytes.SplitSeq(exportContents, pkgDelimiter) {
 			if bytes.HasPrefix(pkg, pkgGocodePrefix) {
-				pkgs = append(pkgs, packageLoadScope(pkg))
+				pkgs = append(pkgs, string(pkg))
 			}
 		}
 		// Load packages in batches. This way, regular usage of the IDE will
 		// still function while we lazy load all packages. Loads from this
 		// routine will be naturally interleaved with loads from IDE usage
 		// because the two workflows will fight over the snapshot mutexes.
-		scopes := lazyLoadScopes{
-			scopes:    pkgs,
+		packageLazyLoader := lazyLoadPkgs{
+			pkgs: pkgs,
+			// batchSize is not an upper bound of the packages that will be
+			// loaded into a snapshot, because the load operation loads
+			// recursively.
 			batchSize: 1000,
+			view:      v,
 		}
-		for batch := range scopes.Next() {
+		for batch := range packageLazyLoader.Next() {
 			select {
 			case <-initCtx.Done():
 				return
@@ -360,18 +364,38 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 	return v, snapshot, snapshot.Acquire()
 }
 
-type lazyLoadScopes struct {
-	scopes    []loadScope
+type lazyLoadPkgs struct {
+	pkgs      []string
 	batchSize int
+	view      *View
 }
 
-func (s *lazyLoadScopes) Next() iter.Seq[[]loadScope] {
+func (s *lazyLoadPkgs) Next() iter.Seq[[]loadScope] {
 	return func(yield func([]loadScope) bool) {
-		for i := 0; i < len(s.scopes); i += s.batchSize {
-			if !yield(s.scopes[i:min(i+s.batchSize, len(s.scopes))]) {
-				return
+		next := make([]loadScope, 0, 1000)
+
+		s.view.snapshot.mu.Lock()
+
+		for _, pkg := range s.pkgs {
+			// Do not load any packages that have already been loaded.
+			if _, ok := s.view.snapshot.packages.Get(PackageID(pkg)); ok {
+				continue
+			}
+			next = append(next, packageLoadScope(pkg))
+
+			if len(next) == 1000 {
+				s.view.snapshot.mu.Unlock()
+				if !yield(next) {
+					return
+				}
+
+				next = next[:0]
+				s.view.snapshot.mu.Lock()
 			}
 		}
+
+		s.view.snapshot.mu.Unlock()
+		yield(next)
 	}
 }
 

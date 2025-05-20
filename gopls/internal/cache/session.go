@@ -325,7 +325,7 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		}
 		// Filter out non-gocode packages. Loading packages works recursively,
 		// so vendored packages will still be loaded this way.
-		var pkgs []packageLoadScope
+		var pkgs []loadScope
 		pkgDelimiter := []byte{'\n'}
 		pkgGocodePrefix := []byte("git.corp.stripe.com/stripe-internal/gocode")
 		for pkg := range bytes.SplitSeq(exportContents, pkgDelimiter) {
@@ -333,32 +333,22 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 				pkgs = append(pkgs, packageLoadScope(pkg))
 			}
 		}
-		// Load one package at a time in the goroutine. This way, regular usage
-		// of the IDE will still function while we lazy load all packages.
-		for _, pkg := range pkgs {
+		// Load packages in batches. This way, regular usage of the IDE will
+		// still function while we lazy load all packages. Loads from this
+		// routine will be naturally interleaved with loads from IDE usage
+		// because the two workflows will fight over the snapshot mutexes.
+		batchSize := 1000
+		for i := 0; i < len(pkgs); i += batchSize {
 			select {
 			case <-initCtx.Done():
 				return
 			default:
 			}
 
-			v.snapshotMu.Lock()
-			// TODO: This can be optimized, we just need to take the
-			// packages.Load call out of the snapshotMu.
-			if err := v.snapshot.load(initCtx, NoNetwork, pkg); err != nil {
+			scopes := pkgs[i:min(i+batchSize, len(pkgs))]
+			if err := v.snapshot.load(initCtx, NoNetwork, scopes...); err != nil {
 				// TODO: Log here instead of panicking.
 				panic(err)
-			}
-			v.snapshotMu.Unlock()
-
-			// Loads will be naturally interleaved somewhat, as a result of
-			// letting goroutines fight over snapshotMu. That being said,
-			// there's some sweet spot between [0, 50ms] here, where sleeping
-			// may make the IDE feel less slow while it lazy loads.
-			select {
-			case <-initCtx.Done():
-				return
-			case <-time.After(50 * time.Millisecond):
 			}
 		}
 	}()

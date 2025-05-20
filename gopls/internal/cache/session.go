@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"maps"
 	"os"
 	"path/filepath"
@@ -337,16 +338,18 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		// still function while we lazy load all packages. Loads from this
 		// routine will be naturally interleaved with loads from IDE usage
 		// because the two workflows will fight over the snapshot mutexes.
-		batchSize := 1000
-		for i := 0; i < len(pkgs); i += batchSize {
+		scopes := lazyLoadScopes{
+			scopes:    pkgs,
+			batchSize: 1000,
+		}
+		for batch := range scopes.Next() {
 			select {
 			case <-initCtx.Done():
 				return
 			default:
 			}
 
-			scopes := pkgs[i:min(i+batchSize, len(pkgs))]
-			if err := v.snapshot.load(initCtx, NoNetwork, scopes...); err != nil {
+			if err := v.snapshot.load(initCtx, NoNetwork, batch...); err != nil {
 				// TODO: Log here instead of panicking.
 				panic(err)
 			}
@@ -355,6 +358,21 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 
 	// Return a third reference to the caller.
 	return v, snapshot, snapshot.Acquire()
+}
+
+type lazyLoadScopes struct {
+	scopes    []loadScope
+	batchSize int
+}
+
+func (s *lazyLoadScopes) Next() iter.Seq[[]loadScope] {
+	return func(yield func([]loadScope) bool) {
+		for i := 0; i < len(s.scopes); i += s.batchSize {
+			if !yield(s.scopes[i:min(i+s.batchSize, len(s.scopes))]) {
+				return
+			}
+		}
+	}
 }
 
 // These keys are used to log view metadata in createView.

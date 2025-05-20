@@ -5,11 +5,9 @@
 package cache
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"iter"
 	"maps"
 	"os"
 	"path/filepath"
@@ -20,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/gopls/internal/cache/metadata"
 	"golang.org/x/tools/gopls/internal/cache/typerefs"
 	"golang.org/x/tools/gopls/internal/file"
@@ -308,95 +307,21 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		defer bgRelease()
 		snapshot.initialize(initCtx, true)
 
-		// TODO: This should call `go list` rather than reading from a magic
-		// file... or maybe, if we plan not to upstream this, we can just find
-		// probable packages heuristically with a glob?
-		//
-		// For PoC purposes, to create go_list_export magic file, run:
-		// go list -e -deps=true -find=false -pgo=off -- git.corp.stripe.com/stripe-internal/gocode/... > go_list_export
-		//
-		// Read from the file.
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			panic(err)
-		}
-		exportContents, err := os.ReadFile(filepath.Join(homeDir, "stripe", "gocode", "go_list_export"))
-		if err != nil {
-			panic(err)
-		}
-		// Filter out non-gocode packages. Loading packages works recursively,
-		// so vendored packages will still be loaded this way.
-		var pkgs []string
-		pkgDelimiter := []byte{'\n'}
-		pkgGocodePrefix := []byte("git.corp.stripe.com/stripe-internal/gocode")
-		for pkg := range bytes.SplitSeq(exportContents, pkgDelimiter) {
-			if bytes.HasPrefix(pkg, pkgGocodePrefix) {
-				pkgs = append(pkgs, string(pkg))
-			}
-		}
-		// Load packages in batches. This way, regular usage of the IDE will
-		// still function while we lazy load all packages. Loads from this
-		// routine will be naturally interleaved with loads from IDE usage
-		// because the two workflows will fight over the snapshot mutexes.
-		packageLazyLoader := lazyLoadPkgs{
-			pkgs: pkgs,
-			// batchSize is not an upper bound of the packages that will be
-			// loaded into a snapshot, because the load operation loads
-			// recursively.
-			batchSize: 1000,
-			view:      v,
-		}
-		for batch := range packageLazyLoader.Next() {
-			select {
-			case <-initCtx.Done():
-				return
-			default:
-			}
+		ctx, cancel := context.WithTimeout(initCtx, 10*time.Minute)
+		defer cancel()
 
-			if err := v.snapshot.load(initCtx, NoNetwork, batch...); err != nil {
-				// TODO: Log here instead of panicking.
-				panic(err)
-			}
+		cfg := snapshot.config(ctx, NoNetwork)
+		pkgs, err := packages.Load(cfg, "git.corp.stripe.com/stripe-internal/gocode/...", "builtin")
+		if err != nil {
+			panic(err)
+		}
+		if err := v.snapshot.loadPackages(ctx, NoNetwork, pkgs); err != nil {
+			panic(err)
 		}
 	}()
 
 	// Return a third reference to the caller.
 	return v, snapshot, snapshot.Acquire()
-}
-
-type lazyLoadPkgs struct {
-	pkgs      []string
-	batchSize int
-	view      *View
-}
-
-func (s *lazyLoadPkgs) Next() iter.Seq[[]loadScope] {
-	return func(yield func([]loadScope) bool) {
-		next := make([]loadScope, 0, 1000)
-
-		s.view.snapshot.mu.Lock()
-
-		for _, pkg := range s.pkgs {
-			// Do not load any packages that have already been loaded.
-			if _, ok := s.view.snapshot.packages.Get(PackageID(pkg)); ok {
-				continue
-			}
-			next = append(next, packageLoadScope(pkg))
-
-			if len(next) == 1000 {
-				s.view.snapshot.mu.Unlock()
-				if !yield(next) {
-					return
-				}
-
-				next = next[:0]
-				s.view.snapshot.mu.Lock()
-			}
-		}
-
-		s.view.snapshot.mu.Unlock()
-		yield(next)
-	}
 }
 
 // These keys are used to log view metadata in createView.

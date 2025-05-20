@@ -318,6 +318,158 @@ func (s *Snapshot) load(ctx context.Context, allowNetwork AllowNetwork, scopes .
 	return nil
 }
 
+func (s *Snapshot) loadPackages(ctx context.Context, allowNetwork AllowNetwork, pkgs []*packages.Package) (err error) {
+	// Keep track of module query -> module path so that we can later correlate query
+	// errors with errors.
+	moduleQueries := make(map[string]string)
+
+	ctx, done := event.Start(ctx, "cache.snapshot.loadPackages")
+	defer done()
+
+	startTime := time.Now()
+
+	cfg := s.config(ctx, allowNetwork)
+
+	defer func() {
+		lbls := append(s.Labels(),
+			label.PackageCount.Of(len(pkgs)),
+			label.Duration.Of(time.Since(startTime)),
+		)
+		event.Log(ctx, "newThing lazyload returned", lbls...)
+	}()
+
+	if len(pkgs) == 0 {
+		return fmt.Errorf("newThing error: %w", errNoPackages)
+	}
+
+	moduleErrs := make(map[string][]packages.Error) // module path -> errors
+	filterFunc := s.view.filterFunc()
+	newMetadata := make(map[PackageID]*metadata.Package)
+	for _, pkg := range pkgs {
+		if pkg.Module != nil && strings.Contains(pkg.Module.Path, "command-line-arguments") {
+			// golang/go#61543: modules containing "command-line-arguments" cause
+			// gopls to get all sorts of confused, because anything containing the
+			// string "command-line-arguments" is treated as a script. And yes, this
+			// happened in practice! (https://xkcd.com/327). Rather than try to work
+			// around this very rare edge case, just fail loudly.
+			return fmt.Errorf(`load failed: module name in %s contains "command-line-arguments", which is disallowed`, pkg.Module.GoMod)
+		}
+		// The Go command returns synthetic list results for module queries that
+		// encountered module errors.
+		//
+		// For example, given a module path a.mod, we'll query for "a.mod/..." and
+		// the go command will return a package named "a.mod/..." holding this
+		// error. Save it for later interpretation.
+		//
+		// See golang/go#50862 for more details.
+		if mod := moduleQueries[pkg.PkgPath]; mod != "" { // a synthetic result for the unloadable module
+			if len(pkg.Errors) > 0 {
+				moduleErrs[mod] = pkg.Errors
+			}
+			continue
+		}
+
+		if s.Options().VerboseOutput {
+			event.Log(ctx, "newThingThing", append(
+				s.Labels(),
+				label.Package.Of(pkg.ID),
+				label.Files.Of(pkg.CompiledGoFiles))...)
+		}
+
+		// Ignore packages with no sources, since we will never be able to
+		// correctly invalidate that metadata.
+		if len(pkg.GoFiles) == 0 && len(pkg.CompiledGoFiles) == 0 {
+			continue
+		}
+		// Special case for the builtin package, as it has no dependencies.
+		if pkg.PkgPath == "builtin" {
+			if len(pkg.GoFiles) != 1 {
+				return fmt.Errorf("only expected 1 file for builtin, got %v", len(pkg.GoFiles))
+			}
+			s.setBuiltin(pkg.GoFiles[0])
+			continue
+		}
+		if pkg.ForTest == "builtin" {
+			// We don't care about test variants of builtin. This caused test
+			// failures in https://go.dev/cl/620196, when a test file was added to
+			// builtin.
+			continue
+		}
+		// Skip test main packages.
+		if isTestMain(pkg, s.view.folder.Env.GOCACHE) {
+			continue
+		}
+		// Skip filtered packages. They may be added anyway if they're
+		// dependencies of non-filtered packages.
+		//
+		// TODO(rfindley): why exclude metadata arbitrarily here? It should be safe
+		// to capture all metadata.
+		// TODO(rfindley): what about compiled go files?
+		if allFilesExcluded(pkg.GoFiles, filterFunc) {
+			continue
+		}
+		buildMetadata(newMetadata, cfg.Dir, false, pkg)
+	}
+
+	s.mu.Lock()
+
+	// Assert the invariant s.packages.Get(id).m == s.meta.metadata[id].
+	for id, ph := range s.packages.All() {
+		if s.meta.Packages[id] != ph.mp {
+			panic("inconsistent metadata")
+		}
+	}
+
+	// Compute the minimal metadata updates (for Clone)
+	// required to preserve the above invariant.
+	var files []protocol.DocumentURI // files to preload
+	seenFiles := make(map[protocol.DocumentURI]bool)
+	updates := make(map[PackageID]*metadata.Package)
+	for _, mp := range newMetadata {
+		if existing := s.meta.Packages[mp.ID]; existing == nil {
+			// Record any new files we should pre-load.
+			for _, uri := range mp.CompiledGoFiles {
+				if !seenFiles[uri] {
+					seenFiles[uri] = true
+					files = append(files, uri)
+				}
+			}
+			updates[mp.ID] = mp
+			s.shouldLoad.Delete(mp.ID)
+		}
+	}
+
+	if s.Options().VerboseOutput {
+		event.Log(ctx, fmt.Sprintf("%s: updating metadata for %d packages", "newThingThingThing", len(updates)))
+	}
+
+	meta := s.meta.Update(updates)
+	workspacePackages := computeWorkspacePackagesLocked(ctx, s, meta)
+	s.meta = meta
+	s.workspacePackages = workspacePackages
+
+	s.mu.Unlock()
+
+	// Opt: preLoad files in parallel.
+	//
+	// Requesting files in batch optimizes the underlying filesystem reads.
+	// However, this is also currently necessary for correctness: populating all
+	// files in the snapshot is necessary for certain operations that rely on the
+	// completeness of the file map, e.g. computing the set of directories to
+	// watch.
+	//
+	// TODO(rfindley, golang/go#57558): determine the set of directories based on
+	// loaded packages, so that reading files here is not necessary for
+	// correctness.
+	s.preloadFiles(ctx, files)
+
+	if len(moduleErrs) > 0 {
+		return &moduleErrorMap{moduleErrs}
+	}
+
+	return nil
+}
+
 type moduleErrorMap struct {
 	errs map[string][]packages.Error // module path -> errors
 }

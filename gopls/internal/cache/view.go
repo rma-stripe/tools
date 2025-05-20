@@ -692,6 +692,7 @@ func (s *Snapshot) initialize(ctx context.Context, firstAttempt bool) {
 			// is actually incorrect when the pattern may match packages in more than
 			// one module. See golang/go#59458 for more details.
 			// scopes = append(scopes, moduleLoadScope{dir: modURI.DirPath(), modulePath: parsed.File.Module.Mod.Path})
+			// TODO: we should still query builtin in this case
 		}
 	} else {
 		scopes = append(scopes, viewLoadScope{})

@@ -89,6 +89,19 @@ type GoEnv struct {
 	//
 	// If GOPACKAGESDRIVER is set to "off", EffectiveGOPACKAGESDRIVER is "".
 	EffectiveGOPACKAGESDRIVER string
+
+	// Experimental setting, read from the GOPLS_DISABLE_MODULE_LOADS environment
+	// variable. May be removed in the future.
+	//
+	// A user may wish to use this setting if they are working with very large
+	// modules. In this case, the performance of certain gopls operations (e.g.
+	// IWL, textDocument/references) becomes prohibitively expensive.
+	//
+	// If set to true, newly created views in module mode (i.e.
+	// [GoModView] and [GoWorkView]) will not load modfiles during
+	// initialization. Results in a state where the server only triggers package
+	// loads on file modification operations (e.g. textDocument/didOpen).
+	DisableModuleLoads bool
 }
 
 // View represents a single build for a workspace.
@@ -151,6 +164,8 @@ type View struct {
 	// Document filters are constructed once, in View.filterFunc.
 	filterFuncOnce sync.Once
 	_filterFunc    func(protocol.DocumentURI) bool // only accessed by View.filterFunc
+
+	disableModuleLoads bool
 }
 
 // definition implements the viewDefiner interface.
@@ -189,6 +204,8 @@ type viewDefinition struct {
 
 	// envOverlay holds additional environment to apply to this viewDefinition.
 	envOverlay map[string]string
+
+	disableModuleLoads bool
 }
 
 // definition implements the viewDefiner interface.
@@ -658,7 +675,15 @@ func (s *Snapshot) initialize(ctx context.Context, firstAttempt bool) {
 		})
 	}
 
-	if len(s.view.workspaceModFiles) > 0 {
+	// Determine scopes to load. If we're loading anything, ensure we also load
+	// builtin, since it provides fake definitions (and documentation) for types
+	// like int that are used everywhere.
+	if len(s.view.workspaceModFiles) == 0 {
+		scopes = append(scopes, viewLoadScope{}, packageLoadScope("builtin"))
+	} else if s.view.disableModuleLoads {
+		// Skip loading modfiles if opted-out.
+		scopes = append(scopes, packageLoadScope("builtin"))
+	} else {
 		for modURI := range s.view.workspaceModFiles {
 			// Verify that the modfile is valid before trying to load it.
 			//
@@ -691,19 +716,12 @@ func (s *Snapshot) initialize(ctx context.Context, firstAttempt bool) {
 			// Previously, we loaded <modulepath>/... for each module path, but that
 			// is actually incorrect when the pattern may match packages in more than
 			// one module. See golang/go#59458 for more details.
-			// scopes = append(scopes, moduleLoadScope{dir: modURI.DirPath(), modulePath: parsed.File.Module.Mod.Path})
+			scopes = append(scopes, moduleLoadScope{dir: modURI.DirPath(), modulePath: parsed.File.Module.Mod.Path})
 		}
-	} else {
-		scopes = append(scopes, viewLoadScope{})
+		if len(scopes) > 0 {
+			scopes = append(scopes, packageLoadScope("builtin"))
+		}
 	}
-
-	// If we're loading anything, ensure we also load builtin,
-	// since it provides fake definitions (and documentation)
-	// for types like int that are used everywhere.
-	if len(scopes) > 0 {
-		scopes = append(scopes, packageLoadScope("builtin"))
-	}
-	loadErr := s.load(ctx, NetworkOK, scopes...)
 
 	// A failure is retryable if it may have been due to context cancellation,
 	// and this is not the initial workspace load (firstAttempt==true).
@@ -711,6 +729,7 @@ func (s *Snapshot) initialize(ctx context.Context, firstAttempt bool) {
 	// The IWL runs on a detached context with a long (~10m) timeout, so
 	// if the context was canceled we consider loading to have failed
 	// permanently.
+	loadErr := s.load(ctx, NetworkOK, scopes...)
 	if loadErr != nil && ctx.Err() != nil && !firstAttempt {
 		return
 	}
@@ -955,6 +974,7 @@ func defineView(ctx context.Context, fs file.Source, folder *Folder, forFile fil
 				def.typ = GoModView
 				def.root = def.gomod.Dir()
 				def.workspaceModFiles = gomodWorkspace()
+				def.disableModuleLoads = folder.Env.DisableModuleLoads
 				if def.envOverlay == nil {
 					def.envOverlay = make(map[string]string)
 				}
@@ -974,6 +994,7 @@ func defineView(ctx context.Context, fs file.Source, folder *Folder, forFile fil
 		def.typ = GoModView
 		def.root = def.gomod.Dir()
 		def.workspaceModFiles = gomodWorkspace()
+		def.disableModuleLoads = folder.Env.DisableModuleLoads
 		return def, nil
 	}
 
@@ -1067,6 +1088,9 @@ func FetchGoEnv(ctx context.Context, folder protocol.DocumentURI, opts *settings
 	} else {
 		env.ExplicitGOWORK = os.Getenv("GOWORK")
 	}
+
+	env.DisableModuleLoads = os.Getenv("GOPLS_DISABLE_MODULE_LOADS") == "1"
+
 	return env, nil
 }
 

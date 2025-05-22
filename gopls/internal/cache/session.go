@@ -245,6 +245,7 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		fs:                   s.overlayFS,
 		viewDefinition:       def,
 		importsState:         newImportsState(backgroundCtx, s.cache.modCache, pe),
+		disableModuleLoads:   def.disableModuleLoads,
 	}
 
 	// Keep this in sync with golang.computeImportEdits.

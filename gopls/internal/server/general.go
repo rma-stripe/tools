@@ -511,6 +511,10 @@ func (s *server) newFolder(ctx context.Context, folder protocol.DocumentURI, nam
 		counter.Inc("gopls/gopackagesdriver")
 	}
 
+	if env.DisableModuleLoads {
+		counter.Inc("gopls/disablemoduleloads")
+	}
+
 	return &cache.Folder{
 		Dir:     folder,
 		Name:    name,
